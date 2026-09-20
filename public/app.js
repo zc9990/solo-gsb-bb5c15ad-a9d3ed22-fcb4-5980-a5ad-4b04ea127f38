@@ -4,6 +4,11 @@
 
 const BINDING_TEXT = { left: '左装订', right: '右装订' };
 const FLIP_TEXT = { long: '长边翻转', short: '短边翻转' };
+const SIDE_TEXT = { front: '正面', back: '背面' };
+const POSITION_TEXT = { left: '左页位', right: '右页位' };
+const ORIENTATION_TEXT = { upright: '正向', rotated: '倒置' };
+const VERIFY_STATUS_TEXT = { verified: '验证通过', undetermined: '无法判定', failed: '验证未通过' };
+const MAX_OBSERVATIONS = 12;
 
 const CANVAS_W = 1240;
 const CANVAS_H = 720;
@@ -22,6 +27,20 @@ const jsonPreview = document.getElementById('jsonPreview');
 const balancedSplitBox = document.getElementById('balancedSplit');
 const chapterSplitBox = document.getElementById('chapterSplit');
 const chapterStartsInput = document.getElementById('chapterStarts');
+const obsForm = document.getElementById('obsForm');
+const obsSignature = document.getElementById('obsSignature');
+const obsSheet = document.getElementById('obsSheet');
+const obsSide = document.getElementById('obsSide');
+const obsPosition = document.getElementById('obsPosition');
+const obsPage = document.getElementById('obsPage');
+const obsOrientation = document.getElementById('obsOrientation');
+const fillCurrentBtn = document.getElementById('fillCurrentBtn');
+const obsError = document.getElementById('obsError');
+const obsCount = document.getElementById('obsCount');
+const obsList = document.getElementById('obsList');
+const verifyBtn = document.getElementById('verifyBtn');
+const clearObsBtn = document.getElementById('clearObsBtn');
+const verifyResult = document.getElementById('verifyResult');
 
 /* 章节优先分帖与均衡分帖互斥；勾选章节模式时才允许填写章节起始页 */
 chapterSplitBox.addEventListener('change', () => {
@@ -53,9 +72,32 @@ const state = {
   result: null,
   flat: [], // 展平的 (帖, 张) 索引，便于逐张浏览
   idx: 0,
+  observations: [], // 试印核验观察（规范化后的本地副本，index 为 1 起始序号）
+  highlight: null,  // 核验定位高亮 { si, shi, side, position }
+  lastPayload: null, // 最近一次成功生成拼版的请求体（核验时原样复用并附加观察）
 };
 
 /* ------------------------------ 数据获取与渲染 ------------------------------ */
+
+/** 将本地观察转换为服务端请求格式（page 为 null 表示看到空白页）。 */
+function observationPayload() {
+  return state.observations.map((o) => ({
+    signature: o.signature,
+    sheet: o.sheet,
+    side: o.side,
+    position: o.position,
+    page: o.blank ? null : o.page,
+    orientation: o.orientation,
+  }));
+}
+
+/** 根据当前结果重建展平索引（核验刷新后结构不变，索引保持稳定）。 */
+function rebuildFlat() {
+  state.flat = [];
+  state.result.signatures.forEach((sig, si) => {
+    sig.sheets.forEach((sheet, shi) => state.flat.push({ si, shi }));
+  });
+}
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -79,23 +121,24 @@ form.addEventListener('submit', async (event) => {
     bleedMm: Number(document.getElementById('bleedMm').value),
     safetyMm: Number(document.getElementById('safetyMm').value),
   };
+  // 已录入观察时随生成一并核验；无观察时请求体与原流程完全一致
+  const requestBody = state.observations.length ? { ...payload, observations: observationPayload() } : payload;
 
   try {
     const resp = await fetch('/api/impose', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(requestBody),
     });
     const data = await resp.json();
     if (!resp.ok) {
       throw new Error(data.error || `服务器返回 ${resp.status}`);
     }
     state.result = data;
-    state.flat = [];
-    data.signatures.forEach((sig, si) => {
-      sig.sheets.forEach((sheet, shi) => state.flat.push({ si, shi }));
-    });
+    state.lastPayload = payload; // 仅生成成功后更新，保证「开始核验」比对的就是当前展示的结果
+    rebuildFlat();
     state.idx = 0;
+    state.highlight = null;
     resultCard.hidden = false;
     renderAll();
   } catch (err) {
@@ -107,6 +150,7 @@ form.addEventListener('submit', async (event) => {
 prevBtn.addEventListener('click', () => {
   if (state.idx > 0) {
     state.idx -= 1;
+    state.highlight = null;
     renderSheetNav();
     draw();
   }
@@ -115,6 +159,7 @@ prevBtn.addEventListener('click', () => {
 nextBtn.addEventListener('click', () => {
   if (state.idx < state.flat.length - 1) {
     state.idx += 1;
+    state.highlight = null;
     renderSheetNav();
     draw();
   }
@@ -122,6 +167,7 @@ nextBtn.addEventListener('click', () => {
 
 sheetSelect.addEventListener('change', () => {
   state.idx = Number(sheetSelect.value);
+  state.highlight = null;
   renderSheetNav();
   draw();
 });
@@ -145,6 +191,7 @@ function renderAll() {
   renderSheetNav();
   renderTable();
   jsonPreview.textContent = JSON.stringify(state.result, null, 2);
+  renderObsPanel();
   draw();
 }
 
@@ -338,6 +385,292 @@ function renderTable() {
   });
 }
 
+/* ------------------------------ 试印核验 ------------------------------ */
+
+function showObsError(message) {
+  obsError.textContent = message;
+  obsError.hidden = false;
+}
+
+/** 填充观察录入表单的帖 / 张下拉（尽量保留当前选择）。 */
+function populateObsForm() {
+  const r = state.result;
+  if (!r) return;
+  const prevSig = obsSignature.value;
+  obsSignature.innerHTML = '';
+  r.signatures.forEach((sig) => {
+    const opt = document.createElement('option');
+    opt.value = String(sig.index);
+    opt.textContent = `第 ${sig.index} 帖（${sig.actualSheetCount} 张）`;
+    obsSignature.appendChild(opt);
+  });
+  if ([...obsSignature.options].some((o) => o.value === prevSig)) {
+    obsSignature.value = prevSig;
+  }
+  refreshObsSheets();
+}
+
+function refreshObsSheets() {
+  const r = state.result;
+  if (!r || !obsSignature.value) return;
+  const prevSheet = obsSheet.value;
+  const sig = r.signatures[Number(obsSignature.value) - 1];
+  obsSheet.innerHTML = '';
+  for (let i = 1; i <= sig.actualSheetCount; i++) {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = `第 ${i} 张`;
+    obsSheet.appendChild(opt);
+  }
+  if ([...obsSheet.options].some((o) => o.value === prevSheet)) {
+    obsSheet.value = prevSheet;
+  }
+}
+
+obsSignature.addEventListener('change', refreshObsSheets);
+
+fillCurrentBtn.addEventListener('click', () => {
+  if (!state.result) return;
+  const pos = state.flat[state.idx];
+  const sig = state.result.signatures[pos.si];
+  obsSignature.value = String(sig.index);
+  refreshObsSheets();
+  obsSheet.value = String(sig.sheets[pos.shi].index);
+});
+
+obsForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  if (!state.result) return;
+  obsError.hidden = true;
+  if (state.observations.length >= MAX_OBSERVATIONS) {
+    showObsError(`最多录入 ${MAX_OBSERVATIONS} 条观察`);
+    return;
+  }
+  const signature = Number(obsSignature.value);
+  const sheet = Number(obsSheet.value);
+  const side = obsSide.value;
+  const position = obsPosition.value;
+  const dup = state.observations.find(
+    (o) => o.signature === signature && o.sheet === sheet && o.side === side && o.position === position
+  );
+  if (dup) {
+    showObsError(`该页位已录入为第 ${dup.index} 条观察，同一页位不可重复观察`);
+    return;
+  }
+  const raw = obsPage.value.trim();
+  let page = null;
+  if (raw !== '') {
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1 || n > state.result.input.totalPages) {
+      showObsError(`页码必须为 1 ~ ${state.result.input.totalPages} 的整数；看到空白页请留空`);
+      return;
+    }
+    page = n;
+  }
+  state.observations.push({
+    index: state.observations.length + 1,
+    signature,
+    sheet,
+    side,
+    position,
+    page,
+    blank: page === null,
+    orientation: obsOrientation.value,
+  });
+  obsPage.value = '';
+  afterObservationsChanged();
+});
+
+clearObsBtn.addEventListener('click', () => {
+  state.observations = [];
+  obsError.hidden = true;
+  afterObservationsChanged();
+});
+
+verifyBtn.addEventListener('click', () => {
+  obsError.hidden = true;
+  runVerification();
+});
+
+/** 观察列表变更后：重渲染列表；若此前已核验过，则自动重核以保证结论与观察一致。 */
+function afterObservationsChanged() {
+  renderObservations();
+  if (state.result && state.result.verification && state.result.verification.enabled) {
+    runVerification();
+  }
+}
+
+/** 以最近一次生成的输入 + 当前观察重新请求 /api/impose 并刷新全部展示。 */
+async function runVerification() {
+  if (!state.lastPayload) return;
+  const payload = { ...state.lastPayload };
+  if (state.observations.length) {
+    payload.observations = observationPayload();
+  }
+  try {
+    const resp = await fetch('/api/impose', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error || `服务器返回 ${resp.status}`);
+    }
+    state.result = data;
+    rebuildFlat();
+    state.idx = Math.min(state.idx, state.flat.length - 1);
+    renderAll();
+  } catch (err) {
+    showObsError(`核验失败：${err.message}`);
+  }
+}
+
+/** 跳到观察 / 差异对应的纸张并高亮页位。 */
+function jumpToSlot(target) {
+  const flatIdx = state.flat.findIndex((p) => p.si === target.signature - 1 && p.shi === target.sheet - 1);
+  if (flatIdx < 0) return;
+  state.idx = flatIdx;
+  state.highlight = { si: target.signature - 1, shi: target.sheet - 1, side: target.side, position: target.position };
+  renderSheetNav();
+  draw();
+  canvas.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function renderObsPanel() {
+  populateObsForm();
+  renderObservations();
+  renderVerification();
+}
+
+function renderObservations() {
+  obsCount.textContent = String(state.observations.length);
+  obsList.innerHTML = '';
+  state.observations.forEach((obs, i) => {
+    obs.index = i + 1; // 删除后重编号，与服务端规范化序号一致
+    const li = document.createElement('li');
+    const text = document.createElement('span');
+    text.className = 'obs-text';
+    text.textContent = `#${obs.index} 第 ${obs.signature} 帖 · 第 ${obs.sheet} 张 · ${SIDE_TEXT[obs.side]} · ${POSITION_TEXT[obs.position]} — ${obs.blank ? '空白' : `第 ${obs.page} 页`} · ${ORIENTATION_TEXT[obs.orientation]}`;
+    text.title = '点击在预览中定位该页位';
+    text.addEventListener('click', () => jumpToSlot(obs));
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'ghost small-btn';
+    del.textContent = '删除';
+    del.addEventListener('click', () => {
+      state.observations.splice(i, 1);
+      afterObservationsChanged();
+    });
+    li.appendChild(text);
+    li.appendChild(del);
+    obsList.appendChild(li);
+  });
+  verifyBtn.disabled = state.observations.length === 0;
+  clearObsBtn.disabled = state.observations.length === 0;
+}
+
+/** 「看到 / 期望」内容的可读文本（空白页不带朝向）。 */
+function seenText(slot) {
+  return slot.blank ? '空白' : `第 ${slot.page} 页 · ${ORIENTATION_TEXT[slot.orientation]}`;
+}
+
+function diffRowText(d) {
+  const where = `#${d.observation} 第 ${d.signature} 帖 · 第 ${d.sheet} 张 · ${SIDE_TEXT[d.side]} · ${POSITION_TEXT[d.position]}`;
+  if (d.match) {
+    return `${where}：看到「${seenText(d.observed)}」，与期望一致 ✓`;
+  }
+  const parts = [];
+  if (!d.pageMatch) {
+    parts.push(`页码 / 空白不符：期望「${d.expected.blank ? '空白' : `第 ${d.expected.page} 页`}」`);
+  }
+  if (d.orientationMatch === false) {
+    parts.push(`朝向不符：期望「${ORIENTATION_TEXT[d.expected.orientation]}」`);
+  }
+  return `${where}：看到「${seenText(d.observed)}」✗ ${parts.join('；')}`;
+}
+
+function makeBadge(text, cls) {
+  const span = document.createElement('span');
+  span.className = `badge ${cls}`;
+  span.textContent = text;
+  return span;
+}
+
+function renderVerification() {
+  const v = state.result && state.result.verification;
+  verifyResult.innerHTML = '';
+  if (!v || !v.enabled) {
+    const hint = document.createElement('p');
+    hint.className = 'hint';
+    hint.textContent = state.observations.length
+      ? '尚未核验：点击「开始核验」比对四种设置。'
+      : '录入观察后点击「开始核验」；不录入观察时流程与之前完全一致。';
+    verifyResult.appendChild(hint);
+    return;
+  }
+
+  const c = v.conclusion;
+  const banner = document.createElement('div');
+  const bannerCls = c.status === 'verified' ? (c.matchesCurrent ? 'ok' : 'tie') : c.status === 'undetermined' ? 'tie' : 'fail';
+  banner.className = `verify-banner ${bannerCls}`;
+  const title = document.createElement('strong');
+  title.textContent = c.status === 'verified' && !c.matchesCurrent
+    ? `${VERIFY_STATUS_TEXT[c.status]}（实物对应其他设置）`
+    : VERIFY_STATUS_TEXT[c.status];
+  banner.appendChild(title);
+  const msg = document.createElement('span');
+  msg.textContent = c.message;
+  banner.appendChild(msg);
+  if (c.tied.length) {
+    const tiedLine = document.createElement('div');
+    tiedLine.className = 'verify-tied';
+    tiedLine.textContent = `并列组合：${c.tied.map((t) => `${BINDING_TEXT[t.binding]} · ${FLIP_TEXT[t.flip]}`).join('；')}`;
+    banner.appendChild(tiedLine);
+  }
+  verifyResult.appendChild(banner);
+
+  v.candidates.forEach((cand) => {
+    const card = document.createElement('div');
+    card.className = 'verify-candidate';
+    const head = document.createElement('div');
+    head.className = 'verify-candidate-head';
+    const name = document.createElement('span');
+    name.className = 'verify-candidate-title';
+    name.textContent = `#${cand.rank} ${BINDING_TEXT[cand.binding]} · ${FLIP_TEXT[cand.flip]}`;
+    head.appendChild(name);
+    if (cand.isCurrent) head.appendChild(makeBadge('当前设置', 'current'));
+    if (c.status === 'verified' && c.combination.binding === cand.binding && c.combination.flip === cand.flip) {
+      head.appendChild(makeBadge('✓ 唯一零差异', 'ok'));
+    } else if (cand.tied) {
+      head.appendChild(makeBadge('⚠ 并列最优', 'warn'));
+    }
+    const score = document.createElement('span');
+    score.className = 'verify-score';
+    score.textContent = `不符观察 ${cand.wrongObservations} 条 · 不符字段 ${cand.wrongFields} 个`;
+    head.appendChild(score);
+    card.appendChild(head);
+
+    const det = document.createElement('details');
+    if (cand.rank === 1) det.open = true;
+    const sum = document.createElement('summary');
+    sum.textContent = '逐条比对';
+    det.appendChild(sum);
+    cand.details.forEach((d) => {
+      const row = document.createElement('div');
+      row.className = `diff-row${d.match ? '' : ' mismatch'}`;
+      row.textContent = diffRowText(d);
+      if (!d.match) {
+        row.title = '点击跳到对应纸张并高亮页位';
+        row.addEventListener('click', () => jumpToSlot(d));
+      }
+      det.appendChild(row);
+    });
+    card.appendChild(det);
+    verifyResult.appendChild(card);
+  });
+}
+
 /* ------------------------------ Canvas 绘制 ------------------------------ */
 
 function setupCanvas(height) {
@@ -467,7 +800,31 @@ function draw() {
   drawSheet(ctx, frontRect, sheet.front, { rotated: false, isBack: false, ...drawOpts });
   drawSheet(ctx, backRect, sheet.back, { rotated: flip === 'long', isBack: true, ...drawOpts });
   drawFlipDiagram(ctx, { x: 530, y: top, w: 180, h: sheetH }, flip);
+
+  // 核验定位高亮：点击差异 / 观察后，在当前张对应页位画紫色描边
+  if (state.highlight && state.highlight.si === pos.si && state.highlight.shi === pos.shi) {
+    const hRect = state.highlight.side === 'front' ? frontRect : backRect;
+    drawSlotHighlight(ctx, hRect, state.highlight.position);
+  }
+
   drawNotes(ctx, noteLines);
+}
+
+/** 核验定位高亮：在目标页位外画紫色圆角描边并标注。 */
+function drawSlotHighlight(ctx, sheetRect, position) {
+  const rect = position === 'left'
+    ? { x: sheetRect.x, y: sheetRect.y, w: sheetRect.w / 2, h: sheetRect.h }
+    : { x: sheetRect.x + sheetRect.w / 2, y: sheetRect.y, w: sheetRect.w / 2, h: sheetRect.h };
+  ctx.save();
+  ctx.strokeStyle = '#5f3dc4';
+  ctx.lineWidth = 4;
+  roundRect(ctx, rect.x + 4, rect.y + 4, rect.w - 8, rect.h - 8, 6);
+  ctx.stroke();
+  ctx.fillStyle = '#5f3dc4';
+  ctx.font = 'bold 14px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('◆ 核验定位', rect.x + rect.w / 2, rect.y + 24);
+  ctx.restore();
 }
 
 /** 绘制一张纸的一面：纸面、裁切角线、左右页位、折线与骑马钉。 */

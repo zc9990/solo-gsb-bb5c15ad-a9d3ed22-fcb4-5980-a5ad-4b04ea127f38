@@ -117,7 +117,69 @@
       <span class="spacer"></span>
       <button id="exportBtn" type="button">导出拼版清单 JSON</button>
     </div>
-    <canvas id="sheetCanvas" width="1240" height="720"></canvas>
+    <div class="preview-row">
+      <div class="canvas-col">
+        <canvas id="sheetCanvas" width="1240" height="720"></canvas>
+      </div>
+      <aside class="verify-col" aria-label="试印核验">
+        <h2>试印核验</h2>
+        <p class="hint">
+          对照实物纸张录入 1～12 条观察（同一页位不可重复）；服务端用同一输入重算
+          「左/右装订 × 长/短边翻转」四种设置，逐条比对页码、空白与朝向。
+          仅唯一零差异组合判定验证通过；并列最优时返回无法判定，不强行推荐。
+        </p>
+        <form id="obsForm">
+          <div class="field">
+            <label for="obsSignature">帖</label>
+            <select id="obsSignature"></select>
+          </div>
+          <div class="field">
+            <label for="obsSheet">张</label>
+            <select id="obsSheet"></select>
+          </div>
+          <div class="field">
+            <label for="obsSide">面</label>
+            <select id="obsSide">
+              <option value="front">正面</option>
+              <option value="back">背面</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="obsPosition">页位</label>
+            <select id="obsPosition">
+              <option value="left">左页位</option>
+              <option value="right">右页位</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="obsPage">看到的页码（空白页留空）</label>
+            <input id="obsPage" type="number" min="1" step="1" placeholder="空白页留空">
+          </div>
+          <div class="field">
+            <label for="obsOrientation">内容朝向</label>
+            <select id="obsOrientation">
+              <option value="upright">正向（页首朝上）</option>
+              <option value="rotated">倒置（旋转 180°）</option>
+            </select>
+          </div>
+          <div class="field actions">
+            <button type="submit">＋ 添加观察</button>
+          </div>
+          <div class="field actions">
+            <button type="button" id="fillCurrentBtn" class="ghost">填入当前预览张</button>
+          </div>
+        </form>
+        <p class="error" id="obsError" hidden></p>
+        <div class="verify-obs-head">
+          <strong>已录入观察（<span id="obsCount">0</span> / 12）</strong>
+          <span class="spacer"></span>
+          <button id="verifyBtn" type="button" disabled>开始核验</button>
+          <button id="clearObsBtn" type="button" class="ghost" disabled>清空</button>
+        </div>
+        <ul id="obsList" class="obs-list"></ul>
+        <div id="verifyResult"></div>
+      </aside>
+    </div>
 
     <h2>拼版清单</h2>
     <div class="table-wrap">

@@ -1,6 +1,7 @@
 'use strict';
 
 const { parseFitInput, attachFit } = require('./fitCheck');
+const { attachVerification } = require('./verification');
 
 /**
  * 骑马钉（saddle-stitch）拼版计算核心。
@@ -42,6 +43,14 @@ const { parseFitInput, attachFit } = require('./fitCheck');
  * - 偏移符号：左装订时左页位取正、右页位取负；右装订时符号整体反转。
  * - 每个页位（含空白页）都带 offsetMm；纸张厚度或最大补偿量任一为 0（或缺省）时
  *   全部 offsetMm 为 0，页码拼版结果与不启用时完全一致。
+ *
+ * 试印核验（trial print verification）：
+ * - 可选录入 1～12 条实物观察（帖 / 张 / 正背面 / 左右页位 / 看到的页码或空白 / 内容朝向），
+ *   服务端用同一输入重算「左/右装订 × 长/短边翻转」四种设置并逐条比对，
+ *   按「错误观察数最少 → 错误字段数最少 → 当前设置优先 → 固定组合顺序」排序候选；
+ *   仅唯一零差异组合判定验证通过，并列最优时返回无法判定及并列组合（不强行推荐）。
+ * - 非法索引、重复观察返回明确错误；无观察（缺省 / 空数组）时 verification 为
+ *   { enabled: false }，原流程完全不变。
  */
 
 const MAX_TOTAL_PAGES = 10000;
@@ -205,7 +214,9 @@ function planChapterSignatures(totalPages, maxSheets, starts) {
  * @param {boolean} [input.balancedSplit]   是否启用均衡分帖（缺省 false = 固定每帖张数）
  * @param {boolean} [input.chapterSplit]    是否启用章节优先分帖（缺省 false；与均衡分帖互斥）
  * @param {Array<number>} [input.chapterStarts] 章节起始页（严格递增，启用章节优先分帖时必填）
- * @returns {object} 拼版结果（按帖 -> 张 -> 正/背面 -> 左/右页位；启用适配检查时每个页位带 fit）
+ * @param {Array<object>} [input.observations] 试印核验观察（1～12 条；缺省 / 空数组不启用核验）
+ * @returns {object} 拼版结果（按帖 -> 张 -> 正/背面 -> 左/右页位；启用适配检查时每个页位带 fit；
+ *                   启用试印核验时顶层带 verification：观察、候选评分与结论）
  */
 function computeImposition(input) {
   const totalPages = toInteger(input && input.totalPages);
@@ -426,7 +437,7 @@ function computeImposition(input) {
   const result = {
     meta: {
       app: 'saddle-stitch-imposition',
-      version: '1.4.0',
+      version: '1.5.0',
       generatedAt: new Date().toISOString(),
     },
     input: {
@@ -477,6 +488,11 @@ function computeImposition(input) {
   // 纸张规格与出血 / 安全区适配检查：逐页位计算并附加 slot.fit 与顶层 fit 汇总。
   // 未提供纸张 / 成品页尺寸时 fit.enabled = false，页码拼版与爬移结果完全不受影响。
   result.fit = attachFit(result, fit);
+
+  // 试印核验：observations 缺省 / 为空时返回 { enabled: false }，原流程完全不变；
+  // 非法索引、重复观察等抛出明确错误（由调用方转为 400）。
+  // 重算四种组合时递归调用自身（不带 observations，不会再次进入核验分支）。
+  result.verification = attachVerification(result, input && input.observations, computeImposition);
   return result;
 }
 
