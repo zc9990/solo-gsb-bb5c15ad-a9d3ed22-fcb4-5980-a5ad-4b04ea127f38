@@ -13,7 +13,8 @@
 - 可选 **爬移补偿（creep compensation）**：按纸张厚度由外向内平移内层页位，画布叠加原始页位虚线框与补偿后实线框，每个页位（含空白页）输出 `offsetMm`；均衡分帖下按**各帖实际层数**独立重算；
 - 可选 **纸张规格与出血 / 安全区适配检查**：输入纸张宽高、成品页宽高、出血与安全边距后，按每个正反页位的实际方向计算可用矩形，逐页位判定成品页是否放得下、出血是否落在纸张内、安全边距是否过大，并在逐张预览与清单中标出不合格页位；
 - 画布**逐张显示**纸面、页码、空白页位与翻转方向示意；
-- 一键**导出拼版清单 JSON**（包含适配检查结果）。
+- **试印核验**：逐张预览旁可录入 1～12 条试印实物观察（帖 / 张 / 正反面 / 左右页位 / 看到的页码或空白 / 内容朝向），服务端用同一输入分别重算左/右装订 × 长/短边翻转四种设置并逐条比对；仅唯一零差异组合可标记通过，并列最优时返回「无法判定」及并列组合，绝不强行推荐；点击差异可跳到对应纸张并高亮页位；
+- 一键**导出拼版清单 JSON**（包含适配检查结果与试印核验的观察、候选评分和结论）。
 
 ## 快速开始（Docker）
 
@@ -127,6 +128,40 @@ npm test           # 运行拼版逻辑单元测试
 
 每个页位（含空白页）输出 `fit`：`{ ok, rotation, rect, trim, bleedBox, safeBox, violations }`，`violations` 逐条给出超限原因（`page-too-wide` / `page-too-tall` / `bleed-overflow-{left,top,right,bottom}` / `safety-too-wide` / `safety-too-tall`，含具体超出量）；顶层 `fit` 汇总 `ok / totalSlots / failCount`。画布上蓝框 = 裁切线、绿/红虚框 = 出血范围（红 = 超出纸张）、灰点框 = 安全区，不合格页位带红色圆徽，清单对应单元格标红并列出原因。
 
+### 试印核验（trial verification）
+
+在逐张预览旁的「试印核验」面板录入试印实物的观察（API 在 `/api/impose` 上额外传 `observations`），服务端用**同一份输入**分别重算「左/右装订 × 长/短边翻转」四种组合，对每条观察逐个页位比对三个字段：
+
+- **空白 `blank`**：实物看到空白与否是否与该组合一致；
+- **页码 `page`**：仅当观察报告了具体页码时参与——拼版为空白或页码不同均计不符（观察报告空白时无页码字段，不比对页码）；
+- **内容朝向 `orientation`**：`up`（页首朝上）/ `down`（页首朝下）；正面一律朝上，背面长边翻转朝下、短边翻转朝上（与装订方向无关）。
+
+每条观察形如：
+
+```json
+{ "signature": 1, "sheet": 1, "side": "front", "position": "right", "blank": false, "page": 1, "orientation": "up" }
+```
+
+- `signature`：帖号（1 起）、`sheet`：帖内张号（1 起），超出当前拼版范围返回 400；
+- `side`：`front`（正面）/ `back`（背面）；`position`：`left` / `right`；
+- `blank: true` 表示看到空白（此时不得再填 `page`）；`blank: false` 时必须给 `page`（1 ~ totalPages 的整数）；
+- 1～12 条；**同一 (帖, 张, 面, 页位) 只能观察一次**，重复返回明确错误；非数组、空对象、非法枚举、非整数索引同样 400。
+
+候选组合按以下顺序排序（证据优先，后两项仅影响展示次序）：
+
+1. **错误观察数**（含 ≥1 个不符字段的观察条数）最少；
+2. **错误字段数**（所有观察不符字段总数）最少；
+3. **当前设置优先**；
+4. **固定组合顺序**：左/长 → 左/短 → 右/长 → 右/短。
+
+结论 `trialVerification.conclusion.status`：
+
+- `verified`：**唯一**零差异组合（并列零差异不算）。该组合即当前设置时 `matchesCurrent: true`；否则 `matchesCurrent: false`，提示核对设备设置，但不自动改动；
+- `inconclusive`：最优成绩并列（错误观察数与错误字段数都相同），返回 `tied` 并列组合列表，`winner: null`，消息明确「无法判定」，**不做任何推荐**；
+- `mismatch`：唯一最优但仍有差异，四种组合均不能零差异，不标记通过。
+
+`candidates[]` 给出每个组合的 `rank`、`current`、`zeroDifference`、`wrongObservations`、`wrongFields` 与逐条观察的 `observed` / `expected` / `mismatches`（`blank` / `page` / `orientation`）/ `match`。前端在候选明细中点击任意一条差异即可跳到对应 (帖, 张) 的纸张并以红色框高亮该页位。导出 JSON 原样包含 `observations`、候选评分与结论；**不传或传空数组时 `trialVerification = { enabled: false }`，拼版结果与旧版本完全一致**。
+
 ## API
 
 ### `POST /api/impose`
@@ -149,7 +184,10 @@ npm test           # 运行拼版逻辑单元测试
   "pageWidth": 210,
   "pageHeight": 297,
   "bleedMm": 3,
-  "safetyMm": 5
+  "safetyMm": 5,
+  "observations": [
+    { "signature": 1, "sheet": 1, "side": "front", "position": "right", "blank": false, "page": 1, "orientation": "up" }
+  ]
 }
 ```
 
@@ -164,6 +202,7 @@ npm test           # 运行拼版逻辑单元测试
 - `maxCompensation`：**可选**，爬移最大补偿量（mm，≥ 0，缺省为 0）
 - `paperWidth` / `paperHeight` / `pageWidth` / `pageHeight`：**可选**，纸张与成品页宽高（mm）；全部缺省或为 0 时不做适配检查，提供任意一项则四项必须全部 > 0
 - `bleedMm` / `safetyMm`：**可选**，出血与安全边距（mm，≥ 0，缺省为 0）
+- `observations`：**可选**，试印实物观察数组（1～12 条，字段见上文「试印核验」）；缺省 / `[]` 不核验，返回 `trialVerification: { enabled: false }`，其余结果与旧版本完全一致；非法索引、非法枚举或重复观察返回 400 明确错误
 
 后两个爬移参数任一为 0（或不传）时不做爬移补偿，所有页位 `offsetMm` 为 0，旧调用方无需改动。
 
@@ -268,7 +307,9 @@ npm test           # 运行拼版逻辑单元测试
 
 顶层 `fit` 汇总：`{ enabled, paperWidth, paperHeight, pageWidth, pageHeight, bleedMm, safetyMm, slotWidth, slotHeight, ok, totalSlots, failCount }`；未启用时仅为 `{ "enabled": false }`。
 
-参数非法时返回 `400` 与错误信息（含纸张厚度 / 最大补偿量为负，尺寸参数为负、非数字或只提供部分尺寸，`balancedSplit` / `chapterSplit` 非布尔值，两种分帖模式同时启用，章节起始页非数组 / 为空 / 非整数 / 重复 / 未递增 / 越界等情况）。另提供 `GET /api/health` 健康检查。
+启用试印核验时顶层 `trialVerification`：`{ enabled, observations, current, conclusion: { status, message, matchesCurrent, winner, tied }, candidates: [...] }`（各字段含义见上文「试印核验」）；未启用时仅为 `{ "enabled": false }`。
+
+参数非法时返回 `400` 与错误信息（含纸张厚度 / 最大补偿量为负，尺寸参数为负、非数字或只提供部分尺寸，`balancedSplit` / `chapterSplit` 非布尔值，两种分帖模式同时启用，章节起始页非数组 / 为空 / 非整数 / 重复 / 未递增 / 越界，试印观察非数组 / 超 12 条 / 非法帖号张号 / 非法正反面页位朝向枚举 / 页码越界 / 空白与页码冲突 / 重复观察等情况）。另提供 `GET /api/health` 健康检查。
 
 ## 目录结构
 
@@ -276,13 +317,15 @@ npm test           # 运行拼版逻辑单元测试
 ├── server.js            # Express 服务：静态页面 + /api/impose
 ├── src/imposition.js    # 拼版计算核心（固定 / 均衡 / 章节优先分帖、正反面页位、翻转坐标变换、爬移补偿 offsetMm）
 ├── src/fitCheck.js      # 纸张规格与出血 / 安全区适配检查（可用矩形、trim/bleed/safe、超限原因）
-├── public/              # 前端（原生 Canvas 逐张绘制、原始/补偿页位叠加、适配标记、JSON 导出）
+├── src/trialVerification.js # 试印核验（观察校验、四种装订/翻转组合重算打分、结论与并列判定）
+├── public/              # 前端（原生 Canvas 逐张绘制、原始/补偿页位叠加、适配标记、试印核验面板、JSON 导出）
 │   ├── index.html
 │   ├── app.js
 │   └── style.css
 ├── test/imposition.test.js
 ├── test/fitCheck.test.js
 ├── test/chapterSplit.test.js
+├── test/trialVerification.test.js
 ├── Dockerfile
 └── docker-compose.yml
 ```

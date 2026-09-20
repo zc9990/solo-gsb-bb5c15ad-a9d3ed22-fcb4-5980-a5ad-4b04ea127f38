@@ -19,8 +19,10 @@ app.get('/api/health', (req, res) => {
  *   totalPages, sheetsPerSignature, binding: 'left'|'right', flip: 'long'|'short',
  *   paperThickness?, maxCompensation?,                       // 可选，纸张厚度与爬移最大补偿量（mm，缺省/为 0 不补偿）
  *   balancedSplit?                                           // 可选，true = 均衡分帖（缺省 false = 固定分帖）
+ *   observations?: [...]                                     // 可选，1~12 条试印实物观察（缺省/空数组 = 不核验，走原流程）
  * }
- * 响应：拼版清单 JSON（与前端「导出拼版清单 JSON」内容一致）
+ * 响应：拼版清单 JSON（与前端「导出拼版清单 JSON」内容一致；带 observations 时
+ *       顶层 trialVerification 含观察、四种候选评分与核验结论）
  */
 app.post('/api/impose', (req, res) => {
   try {

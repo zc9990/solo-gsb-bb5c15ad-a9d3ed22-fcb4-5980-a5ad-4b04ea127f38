@@ -117,7 +117,27 @@
       <span class="spacer"></span>
       <button id="exportBtn" type="button">导出拼版清单 JSON</button>
     </div>
-    <canvas id="sheetCanvas" width="1240" height="720"></canvas>
+    <div class="preview-trial">
+      <canvas id="sheetCanvas" width="1240" height="720"></canvas>
+      <aside class="trial-panel" id="trialPanel" aria-label="试印核验">
+        <h2>试印核验</h2>
+        <p class="trial-intro">
+          录入试印实物上看到的页码 / 空白与内容朝向（1～12 条），服务端用同一输入分别重算
+          左/右装订 × 长/短边翻转四种设置并逐条比对；仅唯一零差异组合可判定通过，并列时返回无法判定。
+        </p>
+        <div class="trial-actions">
+          <button id="addObservationBtn" type="button" class="ghost">＋ 按当前纸张新增观察</button>
+          <span id="observationCount" class="observation-count">0 / 12</span>
+        </div>
+        <div id="observationList" class="observation-list"></div>
+        <div class="trial-actions">
+          <button id="verifyBtn" type="button">试印核验</button>
+          <button id="clearTrialBtn" type="button" class="ghost">清空观察</button>
+        </div>
+        <p class="error" id="trialError" hidden></p>
+        <div id="trialResult" class="trial-result"></div>
+      </aside>
+    </div>
 
     <h2>拼版清单</h2>
     <div class="table-wrap">

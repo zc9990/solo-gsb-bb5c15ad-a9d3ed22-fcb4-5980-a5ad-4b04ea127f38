@@ -23,6 +23,27 @@ const balancedSplitBox = document.getElementById('balancedSplit');
 const chapterSplitBox = document.getElementById('chapterSplit');
 const chapterStartsInput = document.getElementById('chapterStarts');
 
+/* 试印核验面板元素 */
+const addObservationBtn = document.getElementById('addObservationBtn');
+const observationListEl = document.getElementById('observationList');
+const observationCountEl = document.getElementById('observationCount');
+const verifyBtn = document.getElementById('verifyBtn');
+const clearTrialBtn = document.getElementById('clearTrialBtn');
+const trialErrorEl = document.getElementById('trialError');
+const trialResultEl = document.getElementById('trialResult');
+
+const TRIAL_STATUS_TEXT = { verified: '核验通过', inconclusive: '无法判定', mismatch: '核验未通过' };
+const SIDE_TEXT = { front: '正面', back: '背面' };
+const POSITION_TEXT = { left: '左页位', right: '右页位' };
+const ORIENTATION_TEXT = { up: '页首朝上', down: '页首朝下' };
+const FIELD_TEXT = { blank: '空白', page: '页码', orientation: '朝向' };
+const COMBO_TEXT = {
+  'left-long': '左装订 · 长边翻转',
+  'left-short': '左装订 · 短边翻转',
+  'right-long': '右装订 · 长边翻转',
+  'right-short': '右装订 · 短边翻转',
+};
+
 /* 章节优先分帖与均衡分帖互斥；勾选章节模式时才允许填写章节起始页 */
 chapterSplitBox.addEventListener('change', () => {
   chapterStartsInput.disabled = !chapterSplitBox.checked;
@@ -53,14 +74,12 @@ const state = {
   result: null,
   flat: [], // 展平的 (帖, 张) 索引，便于逐张浏览
   idx: 0,
+  observationDrafts: [], // 试印观察录入草稿（未随拼版重算前可自由增删）
+  highlight: null,       // 页位高亮：{ signature, sheet, side, position }（点击差异跳转后设置）
 };
 
-/* ------------------------------ 数据获取与渲染 ------------------------------ */
-
-form.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  errorBox.hidden = true;
-
+/** 由表单构造拼版请求参数；withObservations=true 时附带录入的试印观察。 */
+function buildPayload(withObservations) {
   const chapterSplit = chapterSplitBox.checked;
   const payload = {
     totalPages: Number(document.getElementById('totalPages').value),
@@ -79,23 +98,32 @@ form.addEventListener('submit', async (event) => {
     bleedMm: Number(document.getElementById('bleedMm').value),
     safetyMm: Number(document.getElementById('safetyMm').value),
   };
+  if (withObservations) {
+    payload.observations = collectObservations();
+  }
+  return payload;
+}
+
+/* ------------------------------ 数据获取与渲染 ------------------------------ */
+
+form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  errorBox.hidden = true;
+  trialErrorEl.hidden = true;
+
+  const payload = buildPayload(false);
 
   try {
-    const resp = await fetch('/api/impose', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const data = await resp.json();
-    if (!resp.ok) {
-      throw new Error(data.error || `服务器返回 ${resp.status}`);
-    }
+    const data = await postImpose(payload);
     state.result = data;
     state.flat = [];
     data.signatures.forEach((sig, si) => {
       sig.sheets.forEach((sheet, shi) => state.flat.push({ si, shi }));
     });
     state.idx = 0;
+    // 重新生成拼版后清空旧观察草稿、核验结果与高亮（页码结构可能已变）
+    state.observationDrafts = [];
+    state.highlight = null;
     resultCard.hidden = false;
     renderAll();
   } catch (err) {
@@ -104,27 +132,33 @@ form.addEventListener('submit', async (event) => {
   }
 });
 
-prevBtn.addEventListener('click', () => {
-  if (state.idx > 0) {
-    state.idx -= 1;
-    renderSheetNav();
-    draw();
+/** 调用 /api/impose 并在非 2xx 时抛出服务端错误信息。 */
+async function postImpose(payload) {
+  const resp = await fetch('/api/impose', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    throw new Error(data.error || `服务器返回 ${resp.status}`);
   }
-});
+  return data;
+}
 
-nextBtn.addEventListener('click', () => {
-  if (state.idx < state.flat.length - 1) {
-    state.idx += 1;
-    renderSheetNav();
-    draw();
-  }
-});
-
-sheetSelect.addEventListener('change', () => {
-  state.idx = Number(sheetSelect.value);
+function gotoSheet(index) {
+  if (index < 0 || index >= state.flat.length || index === state.idx) return;
+  state.idx = index;
+  state.highlight = null; // 手动换张时清除差异高亮
   renderSheetNav();
   draw();
-});
+}
+
+prevBtn.addEventListener('click', () => gotoSheet(state.idx - 1));
+
+nextBtn.addEventListener('click', () => gotoSheet(state.idx + 1));
+
+sheetSelect.addEventListener('change', () => gotoSheet(Number(sheetSelect.value)));
 
 exportBtn.addEventListener('click', () => {
   if (!state.result) return;
@@ -140,10 +174,329 @@ exportBtn.addEventListener('click', () => {
   URL.revokeObjectURL(url);
 });
 
+/* ------------------------------ 试印核验 ------------------------------ */
+
+/** 当前预览张位置 -> 观察草稿的初始值。 */
+function currentSheetLocation() {
+  const pos = state.flat[state.idx];
+  const sig = state.result.signatures[pos.si];
+  const sheet = sig.sheets[pos.shi];
+  return { signature: sig.index, sheet: sheet.index };
+}
+
+/** 新增一条观察草稿：默认定位在当前预览张的正面左页位。 */
+function addObservationDraft(preset) {
+  const loc = currentSheetLocation();
+  state.observationDrafts.push({
+    signature: loc.signature,
+    sheet: loc.sheet,
+    side: 'front',
+    position: 'left',
+    blank: false,
+    page: '',
+    orientation: 'up',
+    ...(preset || {}),
+  });
+  renderObservations();
+}
+
+addObservationBtn.addEventListener('click', () => addObservationDraft());
+
+clearTrialBtn.addEventListener('click', () => {
+  state.observationDrafts = [];
+  state.highlight = null;
+  trialErrorEl.hidden = true;
+  if (state.result) {
+    state.result.trialVerification = { enabled: false };
+    renderSummary();
+    renderTrialResult();
+    jsonPreview.textContent = JSON.stringify(state.result, null, 2);
+    draw();
+  }
+  renderObservations();
+});
+
+observationListEl.addEventListener('click', (event) => {
+  const delBtn = event.target.closest('.obs-delete');
+  if (!delBtn) return;
+  const i = Number(delBtn.dataset.index);
+  state.observationDrafts.splice(i, 1);
+  renderObservations();
+});
+
+observationListEl.addEventListener('change', (event) => {
+  const el = event.target;
+  const row = el.closest('.obs-row');
+  if (!row) return;
+  const i = Number(row.dataset.index);
+  const draft = state.observationDrafts[i];
+  const field = el.dataset.field;
+  if (field === 'signature' || field === 'sheet') {
+    draft[field] = Number(el.value);
+  } else if (field === 'blank') {
+    draft.blank = el.value === 'true';
+    if (draft.blank) draft.page = '';
+    renderObservations(); // 切换空白时显示 / 隐藏页码输入
+    return;
+  } else {
+    draft[field] = el.value;
+  }
+  // 帖变化时钳制张号到新帖实际张数范围，并刷新张下拉选项（各帖张数可能不同）
+  if (field === 'signature') {
+    const sig = state.result.signatures[draft.signature - 1];
+    if (draft.sheet > sig.sheets.length) draft.sheet = sig.sheets.length;
+    renderObservations();
+  }
+});
+
+/** 从草稿收集观察；页码缺失等明显录入问题在前端先行提示。 */
+function collectObservations() {
+  return state.observationDrafts.map((d) => {
+    const obs = {
+      signature: Number(d.signature),
+      sheet: Number(d.sheet),
+      side: d.side,
+      position: d.position,
+      blank: d.blank,
+      orientation: d.orientation,
+    };
+    if (!d.blank) {
+      const page = String(d.page).trim() === '' ? NaN : Number(d.page);
+      if (!Number.isInteger(page)) {
+        throw new Error('存在未填写页码或页码非整数的观察（空白页请勾选「看到空白」）');
+      }
+      obs.page = page;
+    }
+    return obs;
+  });
+}
+
+/** 渲染观察录入列表。 */
+function renderObservations() {
+  const r = state.result;
+  observationCountEl.textContent = `${state.observationDrafts.length} / 12`;
+  addObservationBtn.disabled = state.observationDrafts.length >= 12 || !r;
+  observationListEl.innerHTML = '';
+  if (state.observationDrafts.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'trial-empty';
+    empty.textContent = '尚未录入观察：可逐张翻看预览，点「＋ 按当前纸张新增观察」记录实物所见。';
+    observationListEl.appendChild(empty);
+    return;
+  }
+  state.observationDrafts.forEach((d, i) => {
+    const row = document.createElement('div');
+    row.className = 'obs-row';
+    row.dataset.index = String(i);
+
+    const select = (field, options, value) => {
+      const sel = document.createElement('select');
+      sel.dataset.field = field;
+      options.forEach(({ value: v, text }) => {
+        const opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = text;
+        if (String(v) === String(value)) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      return sel;
+    };
+
+    const sigSel = select('signature', r.signatures.map((sig) => ({
+      value: sig.index,
+      text: `第 ${sig.index} 帖`,
+    })), d.signature);
+    const sig = r.signatures[Number(d.signature) - 1];
+    const sheetSel = select('sheet', sig.sheets.map((sh) => ({
+      value: sh.index,
+      text: `第 ${sh.index} 张`,
+    })), d.sheet);
+    const sideSel = select('side', [
+      { value: 'front', text: '正面' },
+      { value: 'back', text: '背面' },
+    ], d.side);
+    const posSel = select('position', [
+      { value: 'left', text: '左页位' },
+      { value: 'right', text: '右页位' },
+    ], d.position);
+    const blankSel = select('blank', [
+      { value: 'false', text: '看到页码' },
+      { value: 'true', text: '看到空白' },
+    ], String(d.blank));
+    const oriSel = select('orientation', [
+      { value: 'up', text: '页首朝上' },
+      { value: 'down', text: '页首朝下' },
+    ], d.orientation);
+
+    const pageInput = document.createElement('input');
+    pageInput.type = 'number';
+    pageInput.min = '1';
+    pageInput.max = String(r.input.totalPages);
+    pageInput.step = '1';
+    pageInput.placeholder = '页码';
+    pageInput.dataset.field = 'page';
+    pageInput.value = d.page ?? '';
+    if (d.blank) pageInput.disabled = true;
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'obs-delete ghost';
+    del.dataset.index = String(i);
+    del.textContent = '删除';
+
+    [sigSel, sheetSel, sideSel, posSel, blankSel, pageInput, oriSel, del].forEach((node) => row.appendChild(node));
+    observationListEl.appendChild(row);
+  });
+}
+
+/** 点击「试印核验」：携带观察重新调用同一接口，合并返回的核验结果。 */
+verifyBtn.addEventListener('click', async () => {
+  if (!state.result) return;
+  trialErrorEl.hidden = true;
+  if (state.observationDrafts.length === 0) {
+    trialErrorEl.textContent = '请先至少录入 1 条实物观察（无观察时保持普通拼版流程，无需核验）。';
+    trialErrorEl.hidden = false;
+    return;
+  }
+  let observations;
+  try {
+    observations = collectObservations();
+  } catch (err) {
+    trialErrorEl.textContent = err.message;
+    trialErrorEl.hidden = false;
+    return;
+  }
+  verifyBtn.disabled = true;
+  try {
+    // 以「当前拼版结果的输入参数 + 观察」重算，保证候选中的 current 组合与画布所示一致
+    // （核验针对的是当前拼版结果；改了表单需先重新「生成拼版」）。
+    const payload = { ...state.result.input, observations };
+    const data = await postImpose(payload);
+    state.result.trialVerification = data.trialVerification;
+    renderSummary();
+    renderTrialResult();
+    jsonPreview.textContent = JSON.stringify(state.result, null, 2);
+  } catch (err) {
+    trialErrorEl.textContent = `核验失败：${err.message}`;
+    trialErrorEl.hidden = false;
+  } finally {
+    verifyBtn.disabled = false;
+  }
+});
+
+function comboTextOf(c) {
+  return COMBO_TEXT[`${c.binding}-${c.flip}`];
+}
+
+function seenValueText(seen) {
+  if (seen.blank) return '空白';
+  return `第 ${seen.page} 页 · ${ORIENTATION_TEXT[seen.orientation]}`;
+}
+
+function expectedValueText(exp) {
+  const base = exp.blank ? '空白' : `第 ${exp.page} 页`;
+  return `${base} · ${ORIENTATION_TEXT[exp.orientation]}`;
+}
+
+/** 渲染核验结论与四个候选评分。 */
+function renderTrialResult() {
+  const tv = state.result && state.result.trialVerification;
+  trialResultEl.innerHTML = '';
+  if (!tv || !tv.enabled) {
+    const p = document.createElement('p');
+    p.className = 'trial-empty';
+    p.textContent = '尚未核验：录入观察后点击「试印核验」。';
+    trialResultEl.appendChild(p);
+    return;
+  }
+  const c = tv.conclusion;
+  const banner = document.createElement('div');
+  banner.className = `trial-banner ${c.status}`;
+  banner.innerHTML = '';
+  const title = document.createElement('strong');
+  title.textContent = TRIAL_STATUS_TEXT[c.status];
+  banner.appendChild(title);
+  const msg = document.createElement('span');
+  msg.textContent = c.message;
+  banner.appendChild(msg);
+  trialResultEl.appendChild(banner);
+
+  const list = document.createElement('div');
+  list.className = 'candidate-list';
+  tv.candidates.forEach((cand) => {
+    const item = document.createElement('details');
+    item.className = 'candidate' + (cand.current ? ' current' : '') + (cand.zeroDifference ? ' zero' : '');
+    if (cand.rank === 1) item.open = true;
+
+    const sum = document.createElement('summary');
+    const tags = [];
+    if (cand.current) tags.push('当前');
+    if (cand.zeroDifference) tags.push('零差异');
+    const tagText = tags.length ? `（${tags.join('，')}）` : '';
+    sum.textContent = `#${cand.rank} ${comboTextOf(cand)}${tagText}：错误观察 ${cand.wrongObservations} · 错误字段 ${cand.wrongFields}`;
+    item.appendChild(sum);
+
+    cand.observations.forEach((o) => {
+      const line = document.createElement('div');
+      line.className = 'candidate-obs' + (o.match ? ' match' : ' diff');
+      const locText = `第 ${o.location.signature} 帖第 ${o.location.sheet} 张${SIDE_TEXT[o.location.side]}${POSITION_TEXT[o.location.position]}`;
+      const head = document.createElement('span');
+      head.className = 'obs-loc';
+      head.textContent = o.match
+        ? `✓ ${locText}：${seenValueText(o.observed)}`
+        : `✗ ${locText}：实物「${seenValueText(o.observed)}」≠ 拼版「${expectedValueText(o.expected)}」（不符：${o.mismatches.map((m) => FIELD_TEXT[m]).join('、')}）`;
+      line.appendChild(head);
+      if (!o.match) {
+        line.classList.add('jump-target');
+        line.dataset.signature = String(o.location.signature);
+        line.dataset.sheet = String(o.location.sheet);
+        line.dataset.side = o.location.side;
+        line.dataset.position = o.location.position;
+        const jump = document.createElement('button');
+        jump.type = 'button';
+        jump.className = 'jump-btn ghost';
+        jump.textContent = '跳到该纸并高亮页位 →';
+        line.appendChild(jump);
+      }
+      item.appendChild(line);
+    });
+    list.appendChild(item);
+  });
+  trialResultEl.appendChild(list);
+}
+
+/* 点击差异条目：跳到对应纸张并高亮该页位（跨帖 / 跨张定位）。 */
+trialResultEl.addEventListener('click', (event) => {
+  const target = event.target.closest('.jump-target');
+  if (!target) return;
+  jumpToLocation({
+    signature: Number(target.dataset.signature),
+    sheet: Number(target.dataset.sheet),
+    side: target.dataset.side,
+    position: target.dataset.position,
+  });
+});
+
+/** 按 (帖, 张) 定位 flat 索引并设置高亮，然后滚动到画布。 */
+function jumpToLocation(loc) {
+  const idx = state.flat.findIndex(
+    (p) => state.result.signatures[p.si].index === loc.signature
+      && state.result.signatures[p.si].sheets[p.shi].index === loc.sheet,
+  );
+  if (idx < 0) return;
+  state.idx = idx;
+  state.highlight = loc;
+  renderSheetNav();
+  draw();
+  canvas.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
 function renderAll() {
   renderSummary();
   renderSheetNav();
   renderTable();
+  renderObservations();
+  renderTrialResult();
   jsonPreview.textContent = JSON.stringify(state.result, null, 2);
   draw();
 }
@@ -221,6 +574,15 @@ function renderSummary() {
         ? { text: `适配检查：${r.fit.totalSlots} 个页位全部通过`, cls: 'fit-ok' }
         : { text: `适配检查：${r.fit.failCount} / ${r.fit.totalSlots} 页位不适配`, cls: 'fit-fail' }
     );
+  }
+  if (r.trialVerification && r.trialVerification.enabled) {
+    const c = r.trialVerification.conclusion;
+    const clsMap = { verified: 'trial-verified', inconclusive: 'trial-inconclusive', mismatch: 'trial-mismatch' };
+    chips.push({
+      text: `试印核验：${TRIAL_STATUS_TEXT[c.status]}（${r.trialVerification.observations.length} 条观察）`
+        + (c.status === 'verified' && !c.matchesCurrent ? ' · 零差异组合非当前设置' : ''),
+      cls: c.status === 'verified' && !c.matchesCurrent ? 'trial-inconclusive' : clsMap[c.status],
+    });
   }
   summaryBox.innerHTML = '';
   chips.forEach(({ text, cls }) => {
@@ -466,8 +828,36 @@ function draw() {
 
   drawSheet(ctx, frontRect, sheet.front, { rotated: false, isBack: false, ...drawOpts });
   drawSheet(ctx, backRect, sheet.back, { rotated: flip === 'long', isBack: true, ...drawOpts });
+  drawHighlight(ctx, { frontRect, backRect, sig, sheet });
   drawFlipDiagram(ctx, { x: 530, y: top, w: 180, h: sheetH }, flip);
   drawNotes(ctx, noteLines);
+}
+
+/** 差异跳转高亮：在被核对页位上叠加红色醒目框与「核验差异」徽标。 */
+function drawHighlight(ctx, { frontRect, backRect, sig, sheet }) {
+  const hl = state.highlight;
+  if (!hl || hl.signature !== sig.index || hl.sheet !== sheet.index) return;
+  const rect = hl.side === 'front' ? frontRect : backRect;
+  const x = hl.position === 'left' ? rect.x : rect.x + rect.w / 2;
+  const slotRect = { x, y: rect.y, w: rect.w / 2, h: rect.h };
+  ctx.save();
+  ctx.fillStyle = 'rgba(224, 49, 49, 0.10)';
+  ctx.fillRect(slotRect.x, slotRect.y, slotRect.w, slotRect.h);
+  ctx.strokeStyle = '#e03131';
+  ctx.lineWidth = 4;
+  ctx.setLineDash([12, 7]);
+  ctx.strokeRect(slotRect.x + 3, slotRect.y + 3, slotRect.w - 6, slotRect.h - 6);
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#e03131';
+  roundRect(ctx, slotRect.x + 10, slotRect.y + 10, 118, 26, 6);
+  ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 14px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('核验差异页位', slotRect.x + 69, slotRect.y + 24);
+  ctx.textBaseline = 'alphabetic';
+  ctx.restore();
 }
 
 /** 绘制一张纸的一面：纸面、裁切角线、左右页位、折线与骑马钉。 */

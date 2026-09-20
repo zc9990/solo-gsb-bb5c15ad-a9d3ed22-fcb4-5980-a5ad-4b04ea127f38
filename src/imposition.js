@@ -1,6 +1,7 @@
 'use strict';
 
 const { parseFitInput, attachFit } = require('./fitCheck');
+const { buildTrialVerification } = require('./trialVerification');
 
 /**
  * 骑马钉（saddle-stitch）拼版计算核心。
@@ -245,6 +246,9 @@ function computeImposition(input) {
   if (chapterSplit && balancedSplit) {
     throw new Error('章节优先分帖与均衡分帖不能同时启用，请只选择一种分帖模式');
   }
+  if (input && input.observations !== undefined && input.observations !== null && !Array.isArray(input.observations)) {
+    throw new Error('试印观察 observations 必须为数组（1 ~ 12 条观察对象；缺省或空数组表示不核验）');
+  }
 
   const maxPagesPerSignature = sheetsPerSignature * 4;
 
@@ -426,7 +430,7 @@ function computeImposition(input) {
   const result = {
     meta: {
       app: 'saddle-stitch-imposition',
-      version: '1.4.0',
+      version: '1.5.0',
       generatedAt: new Date().toISOString(),
     },
     input: {
@@ -477,6 +481,13 @@ function computeImposition(input) {
   // 纸张规格与出血 / 安全区适配检查：逐页位计算并附加 slot.fit 与顶层 fit 汇总。
   // 未提供纸张 / 成品页尺寸时 fit.enabled = false，页码拼版与爬移结果完全不受影响。
   result.fit = attachFit(result, fit);
+
+  // 试印核验：observations 缺省 / 空数组时不核验（trialVerification.enabled = false，
+  // 旧调用方与无观察的原流程完全兼容）；有 1 ~ 12 条观察时重算四种装订 / 翻转组合并打分。
+  const hasObservations = Array.isArray(input.observations) && input.observations.length > 0;
+  result.trialVerification = hasObservations
+    ? buildTrialVerification(input, result, computeImposition)
+    : { enabled: false };
   return result;
 }
 
